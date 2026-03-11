@@ -698,9 +698,13 @@ function showLocalFileError() {
 
 // ── MAIN: GET ADVICE ──────────────────
 async function getAdvice() {
+  // Always re-read key fresh — never rely on cached variable
+  geminiKey = (localStorage.getItem('gemini_api_key') || '').trim();
+
   if (!geminiKey) {
     openSetup(); return;
   }
+
   const age      = document.getElementById('patientAge').value.trim();
   const weight   = document.getElementById('patientWeight').value.trim();
   const city     = document.getElementById('patientCity').value.trim();
@@ -771,30 +775,55 @@ Rules:
   }
 
   async function callGemini(apiKey, promptText) {
-    // Gemini REST API — works from https:// origins (GitHub Pages, Netlify, etc.)
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key=${apiKey}`;
-    const resp = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        contents: [{ parts: [{ text: promptText }] }],
-        generationConfig: { temperature: 0.4, maxOutputTokens: 1500 }
-      })
-    });
-    if (resp.status === 400 || resp.status === 403) {
-      const errData = await resp.json().catch(() => ({}));
-      const msg = (errData?.error?.message || '').toLowerCase();
-      if (msg.includes('api key') || msg.includes('invalid') || msg.includes('not valid') || resp.status === 403) {
-        throw new Error('INVALID_KEY');
-      }
-      throw new Error(errData?.error?.message || `HTTP ${resp.status}`);
+    const GEMINI_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key=' + apiKey;
+
+    let resp, data;
+    try {
+      resp = await fetch(GEMINI_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: promptText }] }],
+          generationConfig: { temperature: 0.4, maxOutputTokens: 1500 }
+        })
+      });
+    } catch (netErr) {
+      // Pure network failure
+      throw new Error('NETWORK: ' + netErr.message);
     }
-    if (!resp.ok) throw new Error(`Server error: HTTP ${resp.status}`);
-    const data = await resp.json();
-    const text = (data?.candidates?.[0]?.content?.parts?.[0]?.text || '')
-      .replace(/```json|```/g, '').trim();
+
+    // Parse body regardless of status
+    try { data = await resp.json(); } catch(e) { data = null; }
+
+    const httpStatus  = resp.status;
+    const apiMsg      = data?.error?.message || '';
+    const apiStatus   = data?.error?.status  || '';
+    const rawError    = `HTTP ${httpStatus} | ${apiStatus} | ${apiMsg}`;
+
+    console.log('Gemini response status:', httpStatus);
+    console.log('Gemini response data:', JSON.stringify(data));
+
+    if (!resp.ok) {
+      // Classify error type
+      const m = apiMsg.toLowerCase();
+      if (httpStatus === 403 || m.includes('api key not valid') || m.includes('invalid api key') || m.includes('api_key_invalid')) {
+        throw new Error('INVALID_KEY|' + apiMsg);
+      }
+      if (apiStatus === 'PERMISSION_DENIED' || m.includes('has not been used') || m.includes('disabled for') || m.includes('enable it')) {
+        throw new Error('API_DISABLED|' + apiMsg);
+      }
+      if (apiStatus === 'RESOURCE_EXHAUSTED' || m.includes('quota') || m.includes('rate limit')) {
+        throw new Error('QUOTA|' + apiMsg);
+      }
+      // Default: show raw error
+      throw new Error('APIERR|' + rawError);
+    }
+
+    const text = (data?.candidates?.[0]?.content?.parts?.[0]?.text || '').replace(/```json|```/g, '').trim();
+    if (!text) throw new Error('APIERR|Empty response. candidates=' + JSON.stringify(data?.candidates));
+
     const jsonMatch = text.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) throw new Error('Could not parse AI response. Please try again.');
+    if (!jsonMatch) throw new Error('PARSEERR|' + text.substring(0, 200));
     return JSON.parse(jsonMatch[0]);
   }
 
@@ -803,29 +832,66 @@ Rules:
     renderResults(result, { name, age, weight, city, symptoms });
 
   } catch(err) {
-    let errTitle = '⚠️ Something went wrong';
-    let errMsg = 'Please try again. If the problem persists, check your API key in Settings.';
-    let errAction = `<button onclick="document.getElementById('results').classList.remove('show');document.getElementById('formCard').style.display='block'">← Back to Form</button>`;
+    console.error('MediCare full error:', err.message);
+    const [errCode, errDetail] = (err.message || '').split('|');
 
-    if (err.message === 'INVALID_KEY') {
+    let errTitle, errMsg, errAction;
+
+    if (errCode === 'INVALID_KEY') {
       errTitle = '🔑 Invalid API Key';
-      errMsg = 'Your Gemini API key appears to be invalid or expired. Please update it in Settings.';
-      errAction = `<button onclick="openSettings()">⚙️ Open Settings</button>`;
-    } else if (err.message?.includes('Failed to fetch') || err.message?.includes('NetworkError') || err.message?.includes('CORS') || err.message?.includes('Load failed')) {
-      errTitle = '🌐 Request Blocked';
-      errMsg = `This usually means the app is not being served over HTTPS. Make sure you have uploaded the app to GitHub Pages and are accessing it via the <b>https://yourusername.github.io/...</b> URL, not as a local file.`;
-      errAction = `<button onclick="openGuide()">📖 See GitHub Pages Guide</button>`;
+      errMsg = `Your Gemini API key is not valid.<br><br>
+        <b>Fix:</b> Go to <a href="https://aistudio.google.com/app/apikey" target="_blank" style="color:var(--teal-dark)">aistudio.google.com/app/apikey</a> → copy a fresh key → click ⚙️ Settings to update it.<br><br>
+        <small style="color:var(--muted)">Detail: ${errDetail || 'Invalid key'}</small>`;
+      errAction = `<button onclick="openSettings()">⚙️ Update Key in Settings</button>`;
+
+    } else if (errCode === 'API_DISABLED') {
+      errTitle = '🔌 Gemini API Not Enabled';
+      errMsg = `Your key is valid but the API is not turned on for your project.<br><br>
+        <b>Fix:</b><br>
+        1. Go to <a href="https://aistudio.google.com/app/apikey" target="_blank" style="color:var(--teal-dark)">aistudio.google.com/app/apikey</a><br>
+        2. Click <b>Get API Key</b> → <b>Create API key in new project</b><br>
+        3. Copy the new key → update it in ⚙️ Settings<br><br>
+        <small style="color:var(--muted)">Detail: ${errDetail || ''}</small>`;
+      errAction = `<button onclick="openSettings()">⚙️ Update Key in Settings</button>`;
+
+    } else if (errCode === 'QUOTA') {
+      errTitle = '📊 Daily Quota Exceeded';
+      errMsg = `You've hit today's free usage limit for Gemini API.<br><br>The free tier resets every 24 hours. Try again tomorrow, or visit <a href="https://aistudio.google.com" target="_blank" style="color:var(--teal-dark)">aistudio.google.com</a> to check your usage.<br><br>
+        <small style="color:var(--muted)">Detail: ${errDetail || ''}</small>`;
+      errAction = `<button onclick="getAdvice()">🔄 Try Again</button>`;
+
+    } else if (errCode === 'NETWORK') {
+      errTitle = '🌐 Network Error';
+      errMsg = `Could not reach Gemini API. Check your internet and try again.<br><br>
+        <small style="color:var(--muted)">Detail: ${errDetail || ''}</small>`;
+      errAction = `<button onclick="getAdvice()">🔄 Retry</button>`;
+
+    } else if (errCode === 'PARSEERR') {
+      errTitle = '🔄 Try Again';
+      errMsg = `Gemini returned an unexpected response. This happens occasionally — just retry.<br><br>
+        <small style="color:var(--muted)">Raw: ${(errDetail||'').substring(0,100)}</small>`;
+      errAction = `<button onclick="getAdvice()">🔄 Retry Now</button>`;
+
+    } else {
+      // Show the FULL raw error so we can debug
+      errTitle = '⚠️ Error — Details Below';
+      errMsg = `<b>Full error details (share this with developer):</b><br>
+        <code style="font-size:11px;word-break:break-all;background:#f1f5f9;padding:8px;border-radius:6px;display:block;margin-top:8px;line-height:1.6">${err.message}</code>`;
+      errAction = `<button onclick="openSettings()">⚙️ Check API Key</button>`;
     }
 
-    document.getElementById('results').innerHTML = `
+    document.getElementById('results').innerHTML = \`
       <div class="result-section">
         <div class="error-box">
           <div class="err-icon">😕</div>
-          <h3>${errTitle}</h3>
-          <p>${errMsg}</p>
-          ${errAction}
+          <h3>\${errTitle}</h3>
+          <p style="font-size:13px;line-height:1.7;text-align:left">\${errMsg}</p>
+          <div style="margin-top:16px;display:flex;gap:10px;flex-wrap:wrap;justify-content:center">
+            \${errAction}
+            <button onclick="document.getElementById('results').classList.remove('show');document.getElementById('formCard').style.display='block'" style="background:white;color:var(--slate);border:1.5px solid var(--border);padding:9px 18px;border-radius:9px;font-family:'DM Sans',sans-serif;font-weight:600;font-size:13px;cursor:pointer">← Back to Form</button>
+          </div>
         </div>
-      </div>`;
+      </div>\`;
     document.getElementById('results').classList.add('show');
     document.getElementById('formCard').style.display = 'none';
   } finally {
